@@ -1,0 +1,304 @@
+import numpy as np
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
+from torch.utils.data.sampler import SubsetRandomSampler
+import torch.nn.functional as F
+from sklearn.metrics import confusion_matrix, classification_report
+import seaborn as sns
+
+device = ("cuda" if torch.cuda.is_available() else "cpu")
+
+# Importing the .csv file
+df = pd.read_csv(r'dakofo_g86_blob_table_cleaned_with_splits_GrainTypes.csv')
+pathbase = 'BlobArchive/'
+
+# Defining a new column in the df and assigning a class to each type
+df['Class'] = 0
+df.loc[df['Canola'] == 1, 'Class'] = 0
+df.loc[df['Oat'] == 1, 'Class'] = 1
+df.loc[df['Wheat'] == 1, 'Class'] = 2
+df.loc[df['Barley'] == 1, 'Class'] = 3
+df.loc[df['Rye'] == 1, 'Class'] = 4
+
+df1 = df[df['color'] == 'green']  # Define a new df consisting only of valid images
+df1.reset_index(drop=True, inplace=True)  # Resetting indices after pulling only yhe green values
+
+y_train_val = df1['Class'].tolist()
+x_train_val = [i for i in range(len(df1))]
+
+train_val_indices, test_indices, y_train_val, y_test = train_test_split(x_train_val, y_train_val,
+                                                                        test_size=0.2, stratify=y_train_val)
+
+y_train = y_train_val
+x_train = [i for i in range(len(train_val_indices))]
+train_indices, val_indices, y_train, y_valid = train_test_split(x_train, y_train, test_size=0.2, stratify=y_train)
+
+# Defining a Pytorch dataloader class
+class Dataclass(Dataset):
+    def __init__(self, df1):
+        self.dataframe = df1
+        self.rootdir = 'BlobArchive/'
+
+    # Overriding Dataset with __len__ and __getitem__ of this dataset
+    def __len__(self):
+        return len(self.dataframe)
+
+    def __getitem__(self, idx):  # Reading the images as required (in oppose to saving them all in memory)
+        if torch.is_tensor(idx):
+            idx = idx.tolist()
+        blobname = self.dataframe.iloc[idx]['_id']
+        # blobname = self.dataframe.loc[idx, '_id']  # The name of a "path" to an image
+        blobclass = np.array(self.dataframe.loc[idx, 'Class'])
+        image = np.load((self.rootdir + blobname[-2:] + '/' + blobname + '.npy'))  # Defining the path
+
+        rgb_image = 0
+        if (image.shape[0] <= 256) and (image.shape[1] <= 256):
+            image = image[:, :, [4, 2, 1]]  # First two spaces are the size, while 4,2,1 are red, green and blue
+            rgb_image = image
+        else:
+            rgb_image = image[:256,:256,[4, 2, 1]]
+            
+        # Padding
+        h_upper = int(np.ceil((256 - rgb_image.shape[0]) / 2))
+        h_lower = int(np.floor((256 - rgb_image.shape[0]) / 2))
+        w_left = int(np.ceil((256 - rgb_image.shape[1]) / 2))
+        w_right = int(np.floor((256 - rgb_image.shape[1]) / 2))
+
+        padded = np.pad(rgb_image, [(h_upper, h_lower), (w_left, w_right), (0, 0)], mode='constant')
+        padded = padded.transpose((2, 0, 1))
+
+        return torch.from_numpy(padded), torch.from_numpy(blobclass)
+
+
+
+DL = Dataclass(df1)
+
+batch_size = 64
+
+# Training sampler- and dataloader
+train_sampler = SubsetRandomSampler(train_indices)
+trainLoader = DataLoader(DL, batch_size, sampler=train_sampler)
+
+# Validation sampler- and dataloader
+val_sampler = SubsetRandomSampler(val_indices)
+validationLoader = DataLoader(DL, batch_size, sampler=val_sampler)
+
+# Test sampler- and dataloader
+test_sampler = SubsetRandomSampler(test_indices)
+testLoader = DataLoader(DL, batch_size, sampler=test_sampler)
+
+training_data = enumerate(trainLoader)
+batch_idx, (images, labels) = next(training_data)
+print(type(images))  # Checking the datatype
+print(images.shape)  # the size of the image
+print(labels.shape)  # the size of the labels
+
+
+class Network(nn.Module):
+
+    def __init__(self):
+        super(Network, self).__init__()
+        # Convolutional Neural Network Layer
+        self.convolutaional_neural_network_layers = nn.Sequential(
+            # We have in_channels=3 because our input is a rgb image
+            nn.Conv2d(in_channels=3, out_channels=12, kernel_size=3, padding=1, stride=1),  # (N, 3, 256, 256) #o_c=12
+            nn.ReLU(),          
+            nn.MaxPool2d(kernel_size=2),
+            
+            #Second layer
+            nn.Conv2d(in_channels=12, out_channels=24, kernel_size=3, padding=1, stride=1),  #i_c=12, o_c=24
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2),
+            
+            #Third layer           
+            nn.Conv2d(in_channels=24, out_channels=48, kernel_size=3, padding=1, stride=1),  #i_c=12, o_c=24
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2)
+        )
+        # Linear layer
+        self.linear_layers = nn.Sequential(
+            # We have the output_channel=24 of our second conv layer, and 7*7 is derived by the formular
+            # which is the output of each convolutional layer
+            nn.Linear(in_features=48 * 32 * 32, out_features=32),  #24 instead 80, 32 instead of 64
+            nn.ReLU(),
+            nn.Dropout(p=0.3),  # Dropout with probability of 0.3 to avoid overfitting
+            nn.Linear(in_features=32, out_features=5)  # The output is 5 which should match the size of our class
+        )
+
+    # Defining the forward pass
+    def forward(self, x):
+        x = self.convolutaional_neural_network_layers(x.float())
+        # After we get the output of our convolutional layer we must flatten it or rearrange the output into a vector
+        x = x.view(x.size(0), -1)
+        # Then pass it through the linear layer
+        x = self.linear_layers(x.float())
+        return x
+
+
+model = Network()
+model.to(device)
+
+# Now we use the new custom model:
+for images, labels in trainLoader:
+    outputs = model(images.float().to(device=device))
+    break
+
+probs = F.softmax(outputs, dim=1)
+max_probs, preds = torch.max(probs, dim=1)
+
+# Training the model
+# Defining a loss function; cross entropy
+loss_fn = F.cross_entropy
+loss = loss_fn(outputs.to(device="cpu"), labels.to(device="cpu"))
+print('Loss : ', loss)
+
+# Defining the optimizer
+learning_rate = 0.001  # 0.08
+optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate)  #, weight_decay=0.003)
+
+def loss_batch(model, loss_func, xb, yb,device,
+               opt=None, metric=None):
+    # Calculating the loss
+
+    preds = model(xb)  # Predicting the labels by running the images through the model
+    w0 = len(train_val_indices) / (5 * len(df1['Canola'][df1['Canola'] == 1]))  # weight for canola
+    w1 = len(train_val_indices) / (5 * len(df1['Oat'][df1['Oat'] == 1]))  # weight for oat
+    w2 = len(train_val_indices) / (5 * len(df1['Wheat'][df1['Wheat'] == 1]))  # weight for wheat
+    w3 = len(train_val_indices) / (5 * len(df1['Barley'][df1['Barley'] == 1]))  # weight for barley
+    w4 = len(train_val_indices) / (5 * len(df1['Rye'][df1['Rye'] == 1]))  # weight for rye
+
+    w = torch.Tensor([w0, w1, w2, w3, w4])
+
+    loss = loss_func(preds, yb, w.to(device=device))  # Calculating the loss by comparing the predictions and the actual labels
+
+    if opt is not None:  # Only if an optimizer is provided
+        loss.backward()  # Computing gradients of the losses
+        opt.step()  # Update weights
+        opt.zero_grad()  # Reset gradients
+
+    metric_result = None
+    if metric is not None:
+        # metric_result = metric(preds, yb)  # Compute the metric
+        metric_result = metric(preds, yb)
+
+    return loss.item(), len(xb), metric_result, preds, yb
+
+
+def evaluate(model, loss_fn, valid_dl,device, metric=None):
+    with torch.no_grad():  # Means requires_grad=False for all computations
+        # Passing each batch through the model
+        results = [loss_batch(model, loss_fn,
+                              xb.to(device), yb.to(device),device, metric=metric)
+                   for xb, yb in valid_dl]
+
+        # Separate losses, counts and metrics
+        losses, nums, metrics, preds, labels = zip(*results)
+        _, preds = torch.max(torch.concat(preds), dim=1)
+        cm = confusion_matrix(torch.concat(labels).cpu().numpy(), preds.cpu().numpy())
+        conf = (cm.astype('float')/cm.sum(axis=1)[:, np.newaxis])*100
+
+        # Finding the total size of the dataset
+        total = np.sum(nums)
+        # The average loss across all batches
+        total_loss = np.sum(np.multiply(losses, nums))
+        avg_loss = total_loss / total
+        # The average metric
+        avg_metric = None
+        if metric is not None:
+            tot_metric = np.sum(np.multiply(metrics, nums))
+            avg_metric = tot_metric / total
+    return avg_loss, total, avg_metric,conf
+
+def accuracy(outputs, labels):
+    _, preds = torch.max(outputs, dim=1)
+    return torch.sum(preds == labels).item() / len(preds)
+
+def f1(labels, outputs):
+    _, preds = torch.max(outputs, dim=1)
+    report = classification_report(labels, preds, output_dict=True, zero_division=0)
+    return report['macro avg']['f1-score']
+
+
+val_loss, total, val_acc, _ = evaluate(
+    model, loss_fn, validationLoader,device, metric=accuracy)
+print('Loss: {:.4f}, Accuracy: {:.4f}'
+      .format(val_loss, val_acc))  # Bad since the model hasn't been trained yet
+
+
+# Defining the fit function
+def fit(epochs, model, loss_fn, opt,
+        train_dl, valid_dl,device, metric=None):
+    loss1 = []
+    metric1 = []
+    val_loss1 = []
+    val_metric1 = []
+    for epoch in range(epochs):
+        loss2 = []
+        metric2 = []
+        val_loss2 = []
+        val_metric2 = []
+        for xb, yb in train_dl:
+            loss, BaSize, Metric, _, _ = loss_batch(model, loss_fn, xb.to(device), yb.to(device),device, opt, metric=accuracy)
+            loss2.append(loss)
+            metric2.append(Metric)
+
+        loss1.append(np.mean(loss2))
+        metric1.append(np.mean(metric2))
+
+        result = evaluate(model, loss_fn, valid_dl, device, metric)
+        val_loss, total, val_metric,conf = result
+
+        val_loss1.append(val_loss)
+        val_metric1.append(val_metric)
+
+        if metric is None:
+            print('Train: Epoch [{}/{}], Loss Train: {:.4f}, {}'
+                  .format(epoch+1, epochs, np.mean(loss1)), loss1)  # Avg Loss for all training batches in one epoch
+            print('Val: Epoch [{}/{}], Loss: {:.4f}'
+                  .format(epoch+1, epochs, val_loss))
+        else:
+            print(f'Train: Epoch [{epoch + 1}/{epochs}], Loss: {np.mean(loss1):.4f}, {metric.__name__}: {np.mean(metric1):.4f}')
+            print('Val: Epoch [{}/{}], Loss: {:.4f}, {}: {:.4f}'
+                  .format(epoch+1, epochs, val_loss,
+                          metric.__name__, val_metric))
+
+    plt.plot(loss1, '-')
+    plt.plot(val_loss1, '-')
+    plt.xlabel('epoch')
+    plt.yscale('log')
+    plt.legend(['Train', 'Validation'])
+    plt.title('Train vs Validation loss') 
+    plt.savefig('Pictures/Saved Pictures/Loss_CNN.png')
+
+    plt.figure()
+    plt.plot(metric1, '-')
+    plt.plot(val_metric1, '-')
+    plt.xlabel('epoch')
+    plt.legend(['Train', 'Validation'])
+    plt.title('Train vs Validation accuracy')
+    plt.savefig('Pictures/Saved Pictures/accuracy_CNN.png')
+
+    plt.figure()
+    sns.heatmap(conf, annot=True, fmt='.2f')
+    plt.ylabel('Actual')
+    plt.xlabel('Predicted')
+    plt.savefig('Pictures/Saved Pictures/Heat1.png')
+    plt.show()
+
+
+
+# Redefining model and optimizer
+model = Network()
+optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate)  #, weight_decay=0.003)
+model.to(device)
+
+print(fit(100, model, F.cross_entropy, optimizer, trainLoader, validationLoader,device, accuracy))
+
+# Test accuracy and loss
+test_loss, total, test_acc, _ = evaluate(model, loss_fn, testLoader, device, metric=accuracy)
+print('Overall loss: {:.4f}, Overall accuracy: {:.4f}'.format(test_loss, test_acc))
